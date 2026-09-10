@@ -55,6 +55,8 @@ GDRIVE_BASE="homelab-backups/restic-profile"
 RCLONE_SERVE_PORT=18765
 WEB_PORT=${RESTORECTL_WEB_PORT:-8723}
 WEB_HOST=${RESTORECTL_WEB_HOST:-home}
+# Standalone nginx server block, not a path on the main vhost.
+WEB_UI_PORT=${RESTORECTL_WEB_UI_PORT:-8088}
 SERVICE=system-backup.service
 TIMER=system-backup.timer
 
@@ -458,7 +460,7 @@ web)
       esac ;;
 
 browse)
-      url="http://${WEB_HOST}/restorectl/"
+      url="http://${WEB_HOST}:${WEB_UI_PORT}/"
       echo "opening $url"
       xdg-open "$url" >/dev/null 2>&1 || echo "  (open it manually: $url)" ;;
 
