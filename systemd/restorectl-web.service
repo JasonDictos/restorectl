@@ -1,0 +1,28 @@
+[Unit]
+Description=restorectl web UI (read-only restic browser)
+Documentation=https://github.com/JasonDictos/restorectl
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Binds to loopback only. Exposure is nginx's job, so that authentication
+# and TLS are configured in exactly one place.
+Environment=RESTORECTL_WEB_BIND=127.0.0.1
+Environment=RESTORECTL_WEB_PORT=8723
+Environment=HOME=/root
+# ProtectHome/ProtectSystem make /root read-only, so restic's cache must
+# live somewhere systemd provisions as writable, or every call fails.
+Environment=RESTIC_CACHE_DIR=/var/cache/restorectl
+CacheDirectory=restorectl
+ExecStart=/usr/local/lib/restorectl/restorectl-web.py
+Restart=on-failure
+RestartSec=5
+# Read-only service: it never writes to the repos, so drop the ability to.
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

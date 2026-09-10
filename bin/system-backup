@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# system-backup — nightly whole-machine restic backup, with a mailed report.
+#
+# Runs as root out of system-backup.timer. Backs up every real filesystem on
+# the box (/, /boot, /boot/efi, /home by default) into this host's restic
+# repo, prunes to the retention policy, then mails a readable report.
+#
+# On "differential": restic has no full/incremental/differential modes. Every
+# snapshot is a complete logical view of the paths, while physically only new
+# content-addressed blocks are written. So each night stores just what
+# changed -- differential on disk -- and any snapshot restores standalone
+# without needing a chain. That is strictly better than a full/diff cycle and
+# is why there is no --differential flag to set here.
+#
+# Config lives in /etc/restic/system-backup.conf (see DEFAULTS below).
+set -uo pipefail
+
+CONF=/etc/restic/system-backup.conf
+
+# ---- defaults (override in $CONF) ---------------------------------------
+BACKUP_PATHS="/ /boot /boot/efi /home"
+EXCLUDE_FILE=/etc/restic/excludes.txt
+RESTIC_PASSWORD_FILE=/etc/restic/password
+REPORT_TO=jason
+KEEP_DAILY=14
+KEEP_WEEKLY=8
+KEEP_MONTHLY=12
+KEEP_YEARLY=3
+TAG=system
+# Repo is auto-detected in the same priority order restorectl uses, so the
+# two can never disagree about where this host's backups live.
+REPO_CANDIDATES="
+/mnt/backup/restic-profile/@HOST@
+/PlatterArray/Backups/restic-profile/@HOST@
+/mnt/archive/restic-profile/@HOST@
+/SsdArray/Archive/restic-profile/@HOST@
+"
+
+[ -r "$CONF" ] && . "$CONF"
+
+HOST=$(hostname -s)
+STARTED=$(date +%s)
+STARTED_H=$(date '+%Y-%m-%d %H:%M:%S %Z')
+LOGDIR=/var/log/system-backup
+mkdir -p "$LOGDIR"
+LOG="$LOGDIR/$(date +%Y%m%d-%H%M%S).log"
+JSONLOG="$LOG.json"
+
+log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG" >&2; }
+
+# ---- resolve repo -------------------------------------------------------
+REPO=""
+for p in $(echo "$REPO_CANDIDATES" | sed "s/@HOST@/$HOST/g"); do
+    [ -f "$p/config" ] && { REPO="$p"; break; }
+done
+if [ -z "$REPO" ]; then
+    echo "system-backup: no restic repo found for host '$HOST'" >&2
+    printf 'Subject: [BACKUP FAILED] %s -- no repo found\n\nLooked in:\n%s\n' \
+        "$HOST" "$(echo "$REPO_CANDIDATES" | sed "s/@HOST@/$HOST/g")" \
+        | /usr/sbin/sendmail "$REPORT_TO" 2>/dev/null
+    exit 1
+fi
+
+export RESTIC_REPOSITORY="$REPO"
+export RESTIC_PASSWORD_FILE
+export HOME=/root
+
+log "host=$HOST repo=$REPO"
+log "paths=$BACKUP_PATHS"
+
+# Only back up paths that actually exist and are mounted.
+PATHS=""
+for p in $BACKUP_PATHS; do
+    if [ -e "$p" ]; then PATHS="$PATHS $p"; else log "skip (absent): $p"; fi
+done
+
+# ---- capture the storage layout ----------------------------------------
+# Runs BEFORE the backup so the layout lands inside tonight's snapshot. This
+# is what makes bare-metal restore onto different hardware possible: the
+# recovery environment reads it back out of the snapshot before any disk
+# exists to read it from.
+if [ -x /usr/local/sbin/capture-layout ]; then
+    log "capturing storage layout"
+    /usr/local/sbin/capture-layout /var/lib/restorectl/layout >>"$LOG" 2>&1 \
+        && log "layout captured" \
+        || log "WARNING: layout capture failed -- bare-metal restore will be manual"
+fi
+
+# ---- backup -------------------------------------------------------------
+# --one-file-system stops the walk at mount boundaries, which is what keeps
+# this out of /mnt/archive (the backup target itself), the ZFS docker pool,
+# and every pseudo-filesystem. Each real filesystem is listed explicitly
+# above instead.
+log "starting backup"
+restic backup $PATHS \
+    --one-file-system \
+    --exclude-file="$EXCLUDE_FILE" \
+    --tag "$TAG" \
+    --json > "$JSONLOG" 2>>"$LOG"
+BACKUP_RC=$?
+log "backup exited rc=$BACKUP_RC"
+
+# restic exit codes: 0 = clean, 3 = completed but some files were unreadable.
+# 3 is NOT treated as success here -- unreadable files in a system backup are
+# exactly the thing worth waking up to, so the report says so loudly.
+case "$BACKUP_RC" in
+    0) STATUS="OK" ;;
+    3) STATUS="WARN (some files unreadable)" ;;
+    *) STATUS="FAILED" ;;
+esac
+
+# ---- parse the JSON summary --------------------------------------------
+SUMMARY=$(python3 - "$JSONLOG" <<'PY'
+import json, shlex, sys
+summary = {}
+errors = []
+try:
+    with open(sys.argv[1]) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if msg.get("message_type") == "summary":
+                summary = msg
+            elif msg.get("message_type") == "error":
+                errors.append(msg.get("error", {}).get("message") or str(msg))
+except OSError:
+    pass
+
+def human(n):
+    n = float(n or 0)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PiB"
+
+def emit(k, v):
+    # shlex.quote so values containing spaces ("362.963 GiB") survive eval
+    print(f"BK_{k}={shlex.quote(str(v))}")
+
+if summary:
+    emit("snapshot_id", summary.get("snapshot_id", "?")[:8])
+    emit("files_new", summary.get("files_new", 0))
+    emit("files_changed", summary.get("files_changed", 0))
+    emit("files_unmodified", summary.get("files_unmodified", 0))
+    emit("dirs_new", summary.get("dirs_new", 0))
+    emit("dirs_changed", summary.get("dirs_changed", 0))
+    emit("data_added", human(summary.get("data_added")))
+    emit("data_added_packed", human(summary.get("data_added_packed")))
+    emit("total_files", summary.get("total_files_processed", 0))
+    emit("total_bytes", human(summary.get("total_bytes_processed")))
+    emit("duration", f"{float(summary.get('total_duration', 0)):.0f}")
+else:
+    emit("snapshot_id", "NONE")
+emit("error_count", len(errors))
+for i, e in enumerate(errors[:20]):
+    print(f"BK_ERR_{i}={shlex.quote(str(e))}")
+PY
+)
+eval "$(echo "$SUMMARY" | grep -E '^BK_[A-Za-z_0-9]+=')"
+ERRORS=$(echo "$SUMMARY" | sed -n "s/^BK_ERR_[0-9]*=//p" | tr -d "'")
+
+# ---- retention ----------------------------------------------------------
+log "applying retention: daily=$KEEP_DAILY weekly=$KEEP_WEEKLY monthly=$KEEP_MONTHLY yearly=$KEEP_YEARLY"
+FORGET_OUT=$(restic forget \
+    --keep-daily "$KEEP_DAILY" \
+    --keep-weekly "$KEEP_WEEKLY" \
+    --keep-monthly "$KEEP_MONTHLY" \
+    --keep-yearly "$KEEP_YEARLY" \
+    --prune 2>&1 | tail -30)
+FORGET_RC=$?
+echo "$FORGET_OUT" >> "$LOG"
+
+# ---- repo stats ---------------------------------------------------------
+STATS=$(restic stats --mode raw-data 2>/dev/null | grep -E "Total Size|Total Blob" | sed 's/^ *//')
+SNAPCOUNT=$(restic snapshots --json 2>/dev/null | python3 -c "import json,sys;print(len(json.load(sys.stdin)))" 2>/dev/null || echo "?")
+
+ENDED=$(date +%s)
+ELAPSED=$(( ENDED - STARTED ))
+ELAPSED_H=$(printf '%dh %dm %ds' $((ELAPSED/3600)) $(((ELAPSED%3600)/60)) $((ELAPSED%60)))
+
+# ---- report -------------------------------------------------------------
+REPORT=$(cat <<EOF
+Host        : $HOST
+Status      : $STATUS
+Started     : $STARTED_H
+Duration    : $ELAPSED_H
+Repository  : $REPO
+Snapshot    : ${BK_snapshot_id:-NONE}
+
+WHAT WAS BACKED UP
+------------------
+Paths       :$PATHS
+Excludes    : $EXCLUDE_FILE
+Files new       : ${BK_files_new:-0}
+Files changed   : ${BK_files_changed:-0}
+Files unchanged : ${BK_files_unmodified:-0}
+Total files     : ${BK_total_files:-0}
+Total scanned   : ${BK_total_bytes:-0}
+
+STORED THIS RUN (the differential part -- only new blocks hit the disk)
+----------------------------------------------------------------------
+Data added        : ${BK_data_added:-0}
+After compression : ${BK_data_added_packed:-0}
+
+REPOSITORY
+----------
+Snapshots retained : $SNAPCOUNT
+$STATS
+
+Retention: keep daily=$KEEP_DAILY weekly=$KEEP_WEEKLY monthly=$KEEP_MONTHLY yearly=$KEEP_YEARLY
+$(echo "$FORGET_OUT" | grep -E "remove|keep|Applying|no snapshots" | head -8)
+
+$( [ -n "$ERRORS" ] && { echo "UNREADABLE / ERRORS (${BK_error_count:-0})"; echo "------------------------"; echo "$ERRORS"; } )
+
+RESTORE
+-------
+  restorectl --wtf                 explain this backup and prove it works
+  restorectl snapshots             list what is available
+  restorectl browse                open the web browser UI
+  restorectl restore-system        full system restore (see docs/RECOVERY.md)
+
+Log: $LOG
+EOF
+)
+
+echo "$REPORT" >> "$LOG"
+printf 'Subject: [backup %s] %s -- %s stored, %s\nTo: %s\n\n%s\n' \
+    "$STATUS" "$HOST" "${BK_data_added:-0}" "$ELAPSED_H" "$REPORT_TO" "$REPORT" \
+    | /usr/sbin/sendmail -t 2>/dev/null || log "sendmail failed -- report only in $LOG"
+
+# Keep 90 days of logs.
+find "$LOGDIR" -name '*.log*' -mtime +90 -delete 2>/dev/null
+
+log "done: $STATUS"
+[ "$BACKUP_RC" = "0" ] && exit 0
+[ "$BACKUP_RC" = "3" ] && exit 3
+exit "$BACKUP_RC"

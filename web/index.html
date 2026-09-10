@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>restorectl</title>
+<style>
+:root{
+  --bg:#f7f7f5; --panel:#fff; --ink:#1a1a18; --dim:#6b6b66; --line:#e2e2dd;
+  --accent:#2f6f4f; --accent-soft:#e8f2ec; --warn:#8a5a00; --bad:#a02020;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){
+  --bg:#16171a; --panel:#1d1e22; --ink:#e8e8e4; --dim:#93938c; --line:#2e3036;
+  --accent:#6bbf8f; --accent-soft:#20302a; --warn:#d9a441; --bad:#e08585;
+}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{display:flex;align-items:center;gap:14px;padding:12px 18px;
+  background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+header h1{margin:0;font-size:15px;letter-spacing:.02em}
+header h1 span{color:var(--accent)}
+.host-sel{margin-left:auto;display:flex;align-items:center;gap:8px}
+select,button{font:inherit;color:var(--ink);background:var(--panel);
+  border:1px solid var(--line);border-radius:6px;padding:5px 9px}
+button{cursor:pointer}
+button:hover{border-color:var(--accent)}
+.wrap{display:grid;grid-template-columns:320px 1fr;gap:0;height:calc(100vh - 53px)}
+@media(max-width:820px){.wrap{grid-template-columns:1fr;height:auto}}
+aside{background:var(--panel);border-right:1px solid var(--line);overflow-y:auto;padding:10px 0}
+main{overflow-y:auto;padding:16px 20px}
+.day{padding:7px 16px 3px;font-size:11px;text-transform:uppercase;
+  letter-spacing:.08em;color:var(--dim);font-weight:600}
+.snap{display:flex;align-items:baseline;gap:8px;padding:6px 16px;cursor:pointer;
+  border-left:3px solid transparent}
+.snap:hover{background:var(--accent-soft)}
+.snap.sel{background:var(--accent-soft);border-left-color:var(--accent)}
+.snap .clock{font-variant-numeric:tabular-nums;font-weight:600}
+.snap .id{font-family:var(--mono);font-size:11px;color:var(--dim)}
+.snap .tags{margin-left:auto;font-size:10px;color:var(--dim)}
+.crumbs{display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin-bottom:12px;
+  font-family:var(--mono);font-size:12px}
+.crumbs a{color:var(--accent);cursor:pointer;text-decoration:none}
+.crumbs a:hover{text-decoration:underline}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.06em;
+  color:var(--dim);font-weight:600;padding:6px 8px;border-bottom:1px solid var(--line)}
+td{padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:baseline}
+tr:hover td{background:var(--accent-soft)}
+td.n{font-family:var(--mono)}
+td.sz{text-align:right;font-variant-numeric:tabular-nums;color:var(--dim);white-space:nowrap}
+td.dl{text-align:right;width:1%}
+.dir{color:var(--accent);cursor:pointer;font-weight:600}
+.dir:hover{text-decoration:underline}
+.file{color:var(--ink)}
+a.get{font-size:11px;border:1px solid var(--line);border-radius:5px;
+  padding:2px 7px;text-decoration:none;color:var(--dim);white-space:nowrap}
+a.get:hover{border-color:var(--accent);color:var(--accent)}
+.msg{padding:14px;border-radius:8px;background:var(--panel);border:1px solid var(--line);color:var(--dim)}
+.msg.bad{color:var(--bad);border-color:var(--bad)}
+.stat{display:flex;gap:18px;flex-wrap:wrap;margin-bottom:14px;padding:10px 12px;
+  background:var(--panel);border:1px solid var(--line);border-radius:8px;font-size:12px}
+.stat div span{display:block;color:var(--dim);font-size:10px;
+  text-transform:uppercase;letter-spacing:.06em}
+.stat div b{font-variant-numeric:tabular-nums;font-weight:600}
+.spin{color:var(--dim);padding:20px}
+</style>
+</head>
+<body>
+<header>
+  <h1>restore<span>ctl</span></h1>
+  <div class="host-sel">
+    <label for="host">host</label>
+    <select id="host"></select>
+    <button id="refresh" title="Reload snapshots">↻</button>
+  </div>
+</header>
+
+<div class="wrap">
+  <aside id="snaps"><div class="spin">loading…</div></aside>
+  <main>
+    <div id="stat" class="stat" hidden></div>
+    <div id="crumbs" class="crumbs"></div>
+    <div id="files"><div class="spin">select a snapshot</div></div>
+  </main>
+</div>
+
+<script>
+const API = location.pathname.replace(/\/$/, '');
+const $ = s => document.querySelector(s);
+let state = { host: null, snap: null, path: '/' };
+
+const human = n => {
+  n = Number(n) || 0;
+  const u = ['B','KiB','MiB','GiB','TiB'];
+  let i = 0;
+  while (Math.abs(n) >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(i ? 1 : 0)} ${u[i]}`;
+};
+
+async function api(path, params) {
+  const qs = new URLSearchParams(params || {}).toString();
+  const r = await fetch(`${API}/api/${path}${qs ? '?' + qs : ''}`);
+  const j = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+  if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
+  return j;
+}
+
+function fail(el, e) {
+  el.innerHTML = '';
+  const d = document.createElement('div');
+  d.className = 'msg bad';
+  d.textContent = String(e.message || e);
+  el.append(d);
+}
+
+async function loadHosts() {
+  const sel = $('#host');
+  try {
+    const { hosts } = await api('hosts');
+    sel.innerHTML = '';
+    if (!hosts.length) { fail($('#snaps'), new Error('no repositories found')); return; }
+    for (const h of hosts) {
+      const o = document.createElement('option');
+      o.value = h.host;
+      o.textContent = h.ok ? `${h.host} (${h.snapshots})` : `${h.host} — ${h.error || 'error'}`;
+      o.disabled = !h.ok;
+      sel.append(o);
+    }
+    const preferred = new URLSearchParams(location.search).get('host');
+    if (preferred && hosts.some(h => h.host === preferred)) sel.value = preferred;
+    state.host = sel.value;
+    await loadSnaps();
+  } catch (e) { fail($('#snaps'), e); }
+}
+
+async function loadSnaps() {
+  const box = $('#snaps');
+  box.innerHTML = '<div class="spin">loading…</div>';
+  try {
+    const { snapshots } = await api('snapshots', { host: state.host });
+    box.innerHTML = '';
+    if (!snapshots.length) { box.innerHTML = '<div class="spin">no snapshots</div>'; return; }
+    let day = null;
+    for (const s of snapshots) {
+      if (s.day !== day) {
+        day = s.day;
+        const d = document.createElement('div');
+        d.className = 'day';
+        d.textContent = day;
+        box.append(d);
+      }
+      const row = document.createElement('div');
+      row.className = 'snap';
+      row.dataset.id = s.short_id;
+      row.innerHTML =
+        `<span class="clock">${s.clock}</span>` +
+        `<span class="id">${s.short_id}</span>` +
+        `<span class="tags">${(s.tags || []).join(' ')}</span>`;
+      row.title = (s.paths || []).join('\n');
+      row.onclick = () => pick(s.short_id);
+      box.append(row);
+    }
+    pick(snapshots[0].short_id);
+  } catch (e) { fail(box, e); }
+}
+
+function pick(id) {
+  state.snap = id;
+  state.path = '/';
+  document.querySelectorAll('.snap').forEach(el =>
+    el.classList.toggle('sel', el.dataset.id === id));
+  loadPath();
+}
+
+function crumbs() {
+  const c = $('#crumbs');
+  c.innerHTML = '';
+  const parts = state.path.split('/').filter(Boolean);
+  const mk = (label, path) => {
+    const a = document.createElement('a');
+    a.textContent = label;
+    a.onclick = () => { state.path = path; loadPath(); };
+    return a;
+  };
+  c.append(mk('/', '/'));
+  let acc = '';
+  for (const p of parts) {
+    acc += '/' + p;
+    c.append(document.createTextNode(' / '));
+    c.append(mk(p, acc));
+  }
+}
+
+async function loadPath() {
+  const box = $('#files');
+  box.innerHTML = '<div class="spin">loading…</div>';
+  crumbs();
+  try {
+    const { entries } = await api('ls',
+      { host: state.host, snap: state.snap, path: state.path });
+    const t = document.createElement('table');
+    t.innerHTML = '<thead><tr><th>name</th><th>modified</th>' +
+                  '<th style="text-align:right">size</th><th></th></tr></thead>';
+    const tb = document.createElement('tbody');
+    if (state.path !== '/') {
+      const up = document.createElement('tr');
+      up.innerHTML = '<td class="n"><span class="dir">..</span></td><td></td><td></td><td></td>';
+      up.querySelector('.dir').onclick = () => {
+        state.path = state.path.replace(/\/[^/]+\/?$/, '') || '/';
+        loadPath();
+      };
+      tb.append(up);
+    }
+    for (const e of entries) {
+      const tr = document.createElement('tr');
+      const isDir = e.type === 'dir';
+      const mt = (e.mtime || '').slice(0, 19).replace('T', ' ');
+      tr.innerHTML =
+        `<td class="n"></td><td class="sz">${mt}</td>` +
+        `<td class="sz">${isDir ? '' : human(e.size)}</td><td class="dl"></td>`;
+      const nameEl = document.createElement('span');
+      nameEl.className = isDir ? 'dir' : 'file';
+      nameEl.textContent = isDir ? e.name + '/' : e.name;
+      if (isDir) nameEl.onclick = () => { state.path = e.path; loadPath(); };
+      tr.children[0].append(nameEl);
+      if (!isDir) {
+        const a = document.createElement('a');
+        a.className = 'get';
+        a.textContent = 'download';
+        a.href = `${API}/api/download?` + new URLSearchParams(
+          { host: state.host, snap: state.snap, path: e.path });
+        tr.children[3].append(a);
+      }
+      tb.append(tr);
+    }
+    t.append(tb);
+    box.innerHTML = '';
+    box.append(t);
+    if (!entries.length) box.innerHTML = '<div class="msg">empty directory</div>';
+  } catch (e) { fail(box, e); }
+}
+
+$('#host').onchange = e => { state.host = e.target.value; loadSnaps(); };
+$('#refresh').onclick = () => loadSnaps();
+loadHosts();
+</script>
+</body>
+</html>

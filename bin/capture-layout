@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# capture-layout — snapshot everything needed to rebuild this machine's
+# storage from bare metal onto *different* hardware.
+#
+# Runs immediately before the nightly backup, writing into
+# /var/lib/restorectl/layout/ so the result lands inside the same restic
+# snapshot as the data. Recovery then reads it back out of the snapshot
+# before any disk exists to read it from.
+#
+# The hard part of bare-metal restore is not the bytes, it is the identifiers.
+# fstab, grub, crypttab and the ESP all reference UUIDs/PARTUUIDs that are
+# properties of the *old* filesystems. New disks mean new identifiers, so the
+# restore has to rewrite them. Everything captured here exists to make that
+# rewrite mechanical instead of archaeological.
+#
+# MIT licensed. https://github.com/JasonDictos/restorectl
+set -uo pipefail
+
+OUT=${1:-/var/lib/restorectl/layout}
+mkdir -p "$OUT"
+exec 2> >(tee -a "$OUT/capture.err" >&2)
+
+have() { command -v "$1" >/dev/null 2>&1; }
+cap()  { # cap <file> <command...>
+    local f="$OUT/$1"; shift
+    if have "${1##*/}" || [ -x "${1%% *}" ]; then
+        "$@" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f" || rm -f "$f.tmp"
+    fi
+}
+
+echo "capture-layout: writing to $OUT"
+date -Is > "$OUT/captured-at"
+hostname -f > "$OUT/hostname" 2>/dev/null
+
+# ---- identity -----------------------------------------------------------
+cap os-release        cat /etc/os-release
+cap kernel            uname -a
+cap machine-id        cat /etc/machine-id
+cap cpuinfo           head -30 /proc/cpuinfo
+cap meminfo           head -5 /proc/meminfo
+
+# ---- the mount picture --------------------------------------------------
+cap fstab             cat /etc/fstab
+cap crypttab          cat /etc/crypttab
+cap mtab              findmnt -A --json
+cap mounts-raw        cat /proc/mounts
+cap df                df -hT
+
+# ---- block devices ------------------------------------------------------
+# -J gives the whole tree incl. size, model, serial, wwn, fstype, uuid,
+# partuuid, partlabel -- everything the planner needs to match old roles to
+# new hardware.
+cap lsblk-json        lsblk -J -O
+cap lsblk-tree        lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,UUID,PARTUUID,MOUNTPOINT,MODEL,SERIAL
+cap blkid             blkid
+cap by-uuid           ls -l /dev/disk/by-uuid
+cap by-partuuid       ls -l /dev/disk/by-partuuid
+cap by-id             ls -l /dev/disk/by-id
+
+# ---- partition tables, dumped in a form sfdisk can replay ---------------
+# `sfdisk -d` output is directly consumable by `sfdisk /dev/newdisk < dump`,
+# which is how the restore recreates GPT layouts. Saved per-disk so a machine
+# with a different disk count can be rebuilt disk-by-disk.
+mkdir -p "$OUT/parttables"
+for d in /dev/nvme?n? /dev/sd? /dev/vd? /dev/hd?; do
+    [ -b "$d" ] || continue
+    n=$(basename "$d")
+    sfdisk -d "$d" > "$OUT/parttables/$n.sfdisk" 2>/dev/null || rm -f "$OUT/parttables/$n.sfdisk"
+    sgdisk --backup="$OUT/parttables/$n.gpt" "$d" >/dev/null 2>&1 || true
+    # Disk geometry + identity, so the planner can size-match sensibly.
+    { echo "device=$d"
+      echo "size_bytes=$(blockdev --getsize64 "$d" 2>/dev/null)"
+      echo "logical_sector=$(blockdev --getss "$d" 2>/dev/null)"
+      echo "physical_sector=$(blockdev --getpbsz "$d" 2>/dev/null)"
+      echo "rotational=$(cat /sys/block/$n/queue/rotational 2>/dev/null)"
+      echo "model=$(cat /sys/block/$n/device/model 2>/dev/null | tr -d '\n')"
+    } > "$OUT/parttables/$n.info"
+done
+
+# ---- LVM ----------------------------------------------------------------
+if have pvs; then
+    cap lvm-pvs       pvs --reportformat json
+    cap lvm-vgs       vgs --reportformat json
+    cap lvm-lvs       lvs --reportformat json
+    # vgcfgbackup writes restorable VG metadata; vgcfgrestore replays it.
+    mkdir -p "$OUT/lvm"
+    vgcfgbackup -f "$OUT/lvm/%s.vg" >/dev/null 2>&1 || true
+fi
+
+# ---- mdadm --------------------------------------------------------------
+if have mdadm; then
+    cap mdadm-scan    mdadm --detail --scan
+    cap mdadm-detail  bash -c 'for m in /dev/md*; do [ -b "$m" ] && mdadm --detail "$m"; done'
+fi
+
+# ---- ZFS ----------------------------------------------------------------
+# Pools are NOT recreated automatically by the restore: layout choice (raidz
+# vs stripe vs mirror) on different disk counts is a decision, not a
+# derivation. This captures enough for a human (or the planner's prompt) to
+# make that call knowingly.
+if have zpool; then
+    cap zfs-pools     zpool list -v
+    cap zfs-status    zpool status
+    cap zfs-datasets  zfs list -o name,used,avail,mountpoint,compression,atime
+    cap zfs-props     bash -c 'for p in $(zpool list -H -o name 2>/dev/null); do echo "== $p"; zpool get all "$p"; done'
+    cap zfs-getall    bash -c 'zfs get -H all 2>/dev/null | head -2000'
+fi
+
+# ---- boot ---------------------------------------------------------------
+cap efibootmgr        efibootmgr -v
+cap grub-default      cat /etc/default/grub
+cap grub-cfg          bash -c 'cat /boot/grub2/grub.cfg 2>/dev/null || cat /boot/grub/grub.cfg 2>/dev/null'
+cap grubenv           bash -c 'cat /boot/grub2/grubenv 2>/dev/null'
+cap kernel-cmdline    cat /proc/cmdline
+cap bootloader-entries bash -c 'ls -la /boot/loader/entries/ 2>/dev/null && cat /boot/loader/entries/*.conf 2>/dev/null'
+cap esp-listing       bash -c 'find /boot/efi -maxdepth 4 -type f 2>/dev/null | head -200'
+
+# ---- rebuild inputs -----------------------------------------------------
+# The package list makes it possible to reconstitute a working system even if
+# a file-level restore is partial or the target OS version has moved on.
+if have rpm; then
+    cap packages-rpm  rpm -qa --qf '%{NAME}\n'
+    cap repos-dnf     bash -c 'cat /etc/yum.repos.d/*.repo 2>/dev/null'
+elif have dpkg; then
+    cap packages-deb  dpkg --get-selections
+    cap repos-apt     bash -c 'cat /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null'
+fi
+cap services-enabled  systemctl list-unit-files --state=enabled --no-legend
+cap users             getent passwd
+cap groups            getent group
+cap network-conns     bash -c 'nmcli -t connection show 2>/dev/null'
+
+# ---- a single machine-readable manifest --------------------------------
+python3 - "$OUT" <<'PY' 2>/dev/null || true
+import json, os, subprocess, sys
+out = sys.argv[1]
+
+def sh(cmd):
+    try:
+        return subprocess.run(cmd, shell=True, capture_output=True,
+                              timeout=30).stdout.decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+manifest = {"version": 1, "captured_at": sh("date -Is").strip(),
+            "hostname": sh("hostname -f").strip(), "filesystems": [], "disks": []}
+
+# Every fstab line that names a real filesystem, resolved to its current
+# device + UUID. This is the table the restore replays against new hardware.
+try:
+    for line in open("/etc/fstab"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        f = line.split()
+        if len(f) < 3:
+            continue
+        spec, mnt, fstype = f[0], f[1], f[2]
+        opts = f[3] if len(f) > 3 else "defaults"
+        entry = {"spec": spec, "mount": mnt, "fstype": fstype, "options": opts,
+                 "is_uuid": spec.startswith(("UUID=", "PARTUUID=", "LABEL=")),
+                 "network": fstype in ("nfs", "nfs4", "cifs", "smb3")}
+        if spec.startswith("UUID="):
+            uuid = spec.split("=", 1)[1]
+            dev = sh(f"blkid -U {uuid}").strip()
+            entry["device"] = dev
+            entry["uuid"] = uuid
+            if dev:
+                entry["size_bytes"] = sh(f"blockdev --getsize64 {dev}").strip()
+        manifest["filesystems"].append(entry)
+except OSError:
+    pass
+
+try:
+    manifest["disks"] = json.loads(sh("lsblk -J -O") or "{}").get("blockdevices", [])
+except ValueError:
+    pass
+
+with open(os.path.join(out, "manifest.json"), "w") as fh:
+    json.dump(manifest, fh, indent=2)
+print(f"manifest: {len(manifest['filesystems'])} fstab entries, "
+      f"{len(manifest['disks'])} block devices")
+PY
+
+chmod -R go-rwx "$OUT" 2>/dev/null
+echo "capture-layout: done ($(find "$OUT" -type f | wc -l) files)"

@@ -1,0 +1,477 @@
+#!/usr/bin/env bash
+# restorectl — manage, monitor, browse and restore restic backups.
+#
+# One tool for the whole lifecycle: set the repo up, schedule nightly
+# differential backups, see what is actually protected, browse snapshots as a
+# tree, restore a file or the entire system, and build bootable recovery
+# media when the machine will not come up at all.
+#
+# SETUP & SCHEDULING
+#   setup                     create/verify repo, password, excludes, timer
+#   schedule [SPEC]           show or set the nightly time (systemd OnCalendar)
+#   enable | disable          turn nightly backups on/off
+#   run [--watch]             back up now; --watch streams progress
+#
+# STATUS
+#   wtf                       explain this host's backup posture, find gaps
+#   status                    one-screen summary
+#   snapshots [-n N]          list snapshots (default 20)
+#   stats                     repository statistics
+#
+# BROWSE & RESTORE
+#   tree [SNAP] [PATH]        tree view of a snapshot
+#   ls   [SNAP] [PATH]        list a directory inside a snapshot
+#   find PATTERN [SNAP]       search for a file by name
+#   cat  SNAP PATH            print a file from a snapshot
+#   get  SNAP PATH [DEST]     restore one file or directory
+#   diff SNAP PATH            diff snapshot version against the live file
+#   mount [SNAP] [MNT]        FUSE-mount snapshots read-only
+#   umount [MNT]              unmount
+#   restore-system [SNAP]     guided whole-system restore
+#
+# WEB & TRAY
+#   web install|start|stop|status   manage the browser UI
+#   browse                          open the browser UI
+#   tray                            run the KDE tray monitor
+#
+# RECOVERY MEDIA
+#   mkusb DEVICE              build a bootable recovery USB
+#
+# GLOBAL OPTIONS
+#   -H, --from HOST           operate on another host's repo
+#       --gdrive              read the offsite (Google Drive) copy
+#       --json                machine-readable output where supported
+#
+# https://github.com/JasonDictos/restorectl   MIT licensed
+set -uo pipefail
+
+VERSION="1.0.0"
+THIS_HOST=$(hostname -s)
+TARGET_HOST=$THIS_HOST
+USE_GDRIVE=0
+JSON_OUT=0
+GDRIVE_REMOTE="backup"
+GDRIVE_BASE="homelab-backups/restic-profile"
+RCLONE_SERVE_PORT=18765
+WEB_PORT=${RESTORECTL_WEB_PORT:-8723}
+WEB_HOST=${RESTORECTL_WEB_HOST:-home}
+SERVICE=system-backup.service
+TIMER=system-backup.timer
+
+c_red=$'\e[31m'; c_grn=$'\e[32m'; c_yel=$'\e[33m'; c_blu=$'\e[36m'
+c_bold=$'\e[1m'; c_dim=$'\e[2m'; c_off=$'\e[0m'
+[ -t 1 ] || { c_red=; c_grn=; c_yel=; c_blu=; c_bold=; c_dim=; c_off=; }
+
+ok()   { echo "  ${c_grn}✓${c_off} $*"; }
+bad()  { echo "  ${c_red}✗${c_off} $*"; }
+warn() { echo "  ${c_yel}!${c_off} $*"; }
+info() { echo "  ${c_blu}·${c_off} $*"; }
+head_() { echo; echo "${c_bold}$*${c_off}"; }
+
+# -------------------------------------------------------------------
+# Repo + password discovery. Order matters and is shared with
+# system-backup, so the backup writer and the restore reader can never
+# disagree about where this host's data lives.
+# -------------------------------------------------------------------
+detect_repo() {
+    local host=$1
+    for p in \
+        /mnt/backup/restic-profile/$host \
+        /PlatterArray/Backups/restic-profile/$host \
+        /mnt/archive/restic-profile/$host \
+        /SsdArray/Archive/restic-profile/$host; do
+        [ -f "$p/config" ] && { echo "$p"; return; }
+    done
+    return 1
+}
+
+detect_password() {
+    local host=$1
+    [ -n "${RESTIC_PASSWORD_FILE:-}" ] && [ -f "$RESTIC_PASSWORD_FILE" ] && { echo "$RESTIC_PASSWORD_FILE"; return; }
+    [ "$host" = "$THIS_HOST" ] && [ -f "$HOME/.restic-password" ] && { echo "$HOME/.restic-password"; return; }
+    # Host-specific keys first. /etc/restic/password is THIS machine's key and
+    # is only valid for the local host -- using it for a remote host's repo
+    # fails with "wrong password or no key found".
+    for p in /mnt/archive/keys/jason/restic-password-$host \
+             /SsdArray/Archive/keys/jason/restic-password-$host; do
+        [ -r "$p" ] && { echo "$p"; return; }
+    done
+    if [ "$host" = "$THIS_HOST" ] && [ -r /etc/restic/password ]; then
+        echo /etc/restic/password; return
+    fi
+    return 1
+}
+
+usage() { sed -n '/^# restorectl/,/^set -/p' "$0" | sed '/^set -/d; s/^# \{0,1\}//'; exit "${1:-0}"; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -H|--from) TARGET_HOST=$2; shift 2 ;;
+        --gdrive)  USE_GDRIVE=1; shift ;;
+        --json)    JSON_OUT=1; shift ;;
+        --wtf)     set -- wtf ;;
+        -V|--version) echo "restorectl $VERSION"; exit 0 ;;
+        -h|--help) usage ;;
+        --) shift; break ;;
+        -*) echo "unknown option: $1" >&2; usage 2 ;;
+        *) break ;;
+    esac
+done
+[ $# -lt 1 ] && usage
+
+cmd=$1; shift
+
+# Commands that do not need a repo resolved first.
+case "$cmd" in
+    tray|web|mkusb|setup) NEED_REPO=0 ;;
+    *) NEED_REPO=1 ;;
+esac
+
+PASSWORD_FILE=$(detect_password "$TARGET_HOST" || true)
+RCLONE_SERVE_PID=""
+cleanup_rclone() {
+    [ -n "$RCLONE_SERVE_PID" ] && kill -0 "$RCLONE_SERVE_PID" 2>/dev/null && kill "$RCLONE_SERVE_PID" 2>/dev/null || true
+}
+
+resolve_repo() {
+    if [ "$USE_GDRIVE" = "1" ]; then
+        command -v rclone >/dev/null || { echo "restorectl: rclone not found" >&2; exit 1; }
+        local cfg=""
+        for p in ~/.config/rclone/rclone.conf /home/jason/.config/rclone/rclone.conf; do
+            [ -f "$p" ] && { cfg="$p"; break; }
+        done
+        [ -z "$cfg" ] && { echo "restorectl: rclone config not found" >&2; exit 1; }
+        local gpath="$GDRIVE_REMOTE:$GDRIVE_BASE/$TARGET_HOST"
+        rclone --config "$cfg" ls "$gpath/config" &>/dev/null || {
+            echo "restorectl: no gdrive repo at $gpath" >&2; exit 1; }
+        rclone --config "$cfg" serve restic --addr "localhost:$RCLONE_SERVE_PORT" "$gpath" \
+            &>/tmp/rclone-serve-restic.log &
+        RCLONE_SERVE_PID=$!
+        trap cleanup_rclone EXIT
+        for _ in $(seq 1 15); do
+            curl -sf "http://localhost:$RCLONE_SERVE_PORT/" &>/dev/null && break; sleep 1
+        done
+        export RESTIC_REPOSITORY="rest:http://localhost:$RCLONE_SERVE_PORT/"
+    else
+        REPO=$(detect_repo "$TARGET_HOST") || {
+            echo "restorectl: no restic repo found for host '$TARGET_HOST'" >&2
+            echo "  run: restorectl setup" >&2
+            exit 1
+        }
+        export RESTIC_REPOSITORY="$REPO"
+    fi
+    [ -z "$PASSWORD_FILE" ] && { echo "restorectl: no password file for '$TARGET_HOST'" >&2; exit 1; }
+    export RESTIC_PASSWORD_FILE="$PASSWORD_FILE"
+}
+
+[ "$NEED_REPO" = "1" ] && resolve_repo
+
+# restic may need root to read a system-owned password file or system paths.
+# Read paths pass --no-lock so browsing never blocks behind a running backup.
+# Anything that writes (none, today) must NOT use this wrapper.
+restic_() {
+    local nolock=()
+    case "${1:-}" in
+        snapshots|ls|find|dump|stats|cat|mount|restore) nolock=(--no-lock) ;;
+    esac
+    if [ -r "${RESTIC_PASSWORD_FILE:-/nonexistent}" ]; then
+        restic "${nolock[@]}" "$@"
+    else
+        sudo -E restic "${nolock[@]}" "$@"
+    fi
+}
+
+# -------------------------------------------------------------------
+# Subcommands
+# -------------------------------------------------------------------
+case "$cmd" in
+
+# ---- what the hell is going on --------------------------------------
+wtf)
+    echo "${c_bold}restorectl $VERSION — backup posture for $TARGET_HOST${c_off}"
+
+    head_ "REPOSITORY"
+    info "path      : ${RESTIC_REPOSITORY}"
+    info "password  : ${PASSWORD_FILE}"
+    if restic_ cat config >/dev/null 2>&1; then
+        ok "repository opens and the password is correct"
+    else
+        bad "repository will NOT open — wrong password or corrupt repo"
+    fi
+    repo_fs=$(df -h "${RESTIC_REPOSITORY}" 2>/dev/null | tail -1 | awk '{print $1" ("$4" free)"}')
+    [ -n "$repo_fs" ] && info "backing store: $repo_fs"
+
+    head_ "SCHEDULE"
+    if systemctl is-enabled "$TIMER" >/dev/null 2>&1; then
+        ok "nightly timer enabled ($TIMER)"
+        nextrun=$(systemctl show "$TIMER" -p NextElapseUSecRealtime --value 2>/dev/null)
+        [ -n "$nextrun" ] && info "next run  : $nextrun"
+        last=$(systemctl show "$SERVICE" -p ExecMainExitTimestamp --value 2>/dev/null)
+        [ -n "$last" ] && info "last run  : $last"
+        res=$(systemctl show "$SERVICE" -p Result --value 2>/dev/null)
+        case "$res" in
+            success) ok "last run result: success" ;;
+            "") info "last run result: never run" ;;
+            *) bad "last run result: $res — check: journalctl -u $SERVICE" ;;
+        esac
+        if systemctl is-active "$SERVICE" >/dev/null 2>&1; then
+            warn "a backup is RUNNING right now"
+        fi
+    else
+        bad "nightly timer is NOT enabled — this host is not being backed up"
+        info "fix: restorectl enable"
+    fi
+    if systemctl --user is-enabled restic-profile.timer >/dev/null 2>&1; then
+        warn "the old user-level home-only timer is ALSO enabled"
+        warn "two writers on one repo — disable it: systemctl --user disable --now restic-profile.timer"
+    fi
+
+    head_ "WHAT IS COVERED"
+    if [ -r /etc/restic/excludes.txt ]; then
+        ok "exclude file: /etc/restic/excludes.txt ($(grep -cvE '^\s*#|^\s*$' /etc/restic/excludes.txt) rules)"
+    else
+        warn "no /etc/restic/excludes.txt — backups may include junk"
+    fi
+    latest_paths=$(restic_ snapshots --latest 1 --json 2>/dev/null \
+        | python3 -c "import json,sys;d=json.load(sys.stdin);print(' '.join(d[0]['paths'])) if d else print('')" 2>/dev/null)
+    if [ -n "$latest_paths" ]; then
+        info "latest snapshot covers: $latest_paths"
+        # Only real, block-device-backed filesystems count as "should be backed
+        # up". Bind mounts, docker netns, /run/user and friends are runtime
+        # state that would be noise here, and network/pool filesystems
+        # (nfs, zfs) are deliberately out of scope for a machine backup.
+        for fs in $(findmnt -rno TARGET,FSTYPE,SOURCE 2>/dev/null \
+                    | awk '$3 ~ /^\/dev\// && $2 ~ /^(ext[234]|btrfs|xfs|vfat|f2fs)$/ {print $1}' \
+                    | sort -u); do
+            case " $latest_paths " in
+                *" $fs "*) ok "covered: $fs" ;;
+                *) warn "NOT in the last snapshot: $fs" ;;
+            esac
+        done
+    else
+        bad "no snapshots exist yet"
+    fi
+
+    head_ "HISTORY"
+    total=$(restic_ snapshots --json 2>/dev/null | python3 -c "import json,sys;print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
+    info "snapshots retained: $total"
+    restic_ snapshots --latest 5 --compact 2>/dev/null | tail -8
+
+    head_ "OFFSITE"
+    if [ "${RESTIC_REPOSITORY}" = "/mnt/archive/restic-profile/$TARGET_HOST" ]; then
+        warn "repo is on /mnt/archive (SsdArray) — the gdrive sync EXCLUDES restic-profile/**"
+        warn "so this repo has NO offsite copy; canonical location is /mnt/backup/restic-profile/$TARGET_HOST"
+    elif [ "${RESTIC_REPOSITORY#/mnt/backup}" != "${RESTIC_REPOSITORY}" ]; then
+        ok "repo is on /mnt/backup (PlatterArray) — covered by the nightly gdrive sync"
+    fi
+
+    head_ "RECOVERY READINESS"
+    [ -x /usr/local/bin/restorectl ] && ok "restorectl installed at /usr/local/bin/restorectl" || warn "restorectl not in /usr/local/bin"
+    [ -r /mnt/archive/keys/jason/restic-password-$TARGET_HOST ] \
+        && ok "password escrowed on the NFS archive (survives this machine dying)" \
+        || bad "password NOT escrowed — if this disk dies the backups are unreadable"
+    [ -r "$(dirname "$0")/../docs/RECOVERY.md" ] && ok "recovery runbook present" || info "runbook: https://github.com/JasonDictos/restorectl/blob/main/docs/RECOVERY.md"
+    echo
+    echo "  next: ${c_bold}restorectl tree${c_off} to browse, ${c_bold}restorectl browse${c_off} for the web UI"
+    ;;
+
+status)
+    printf '%-12s %s\n' "host:" "$TARGET_HOST"
+    printf '%-12s %s\n' "repo:" "${RESTIC_REPOSITORY}"
+    printf '%-12s %s\n' "timer:" "$(systemctl is-enabled $TIMER 2>&1) / $(systemctl is-active $SERVICE 2>&1)"
+    printf '%-12s %s\n' "next:" "$(systemctl show $TIMER -p NextElapseUSecRealtime --value 2>/dev/null)"
+    printf '%-12s %s\n' "snapshots:" "$(restic_ snapshots --json 2>/dev/null | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))' 2>/dev/null || echo '?')"
+    ;;
+
+# ---- setup + scheduling ---------------------------------------------
+setup)
+    echo "${c_bold}restorectl setup — $THIS_HOST${c_off}"
+    command -v restic >/dev/null || { bad "restic not installed"; echo "  sudo dnf install -y restic"; exit 1; }
+    ok "restic $(restic version | awk '{print $2}')"
+
+    if ! detect_password "$THIS_HOST" >/dev/null; then
+        warn "no password file; generating /etc/restic/password"
+        sudo mkdir -p /etc/restic
+        openssl rand -base64 48 | sudo tee /etc/restic/password >/dev/null
+        sudo chmod 600 /etc/restic/password
+        sudo mkdir -p /mnt/archive/keys/jason
+        sudo cp /etc/restic/password /mnt/archive/keys/jason/restic-password-$THIS_HOST
+        ok "password created AND escrowed to /mnt/archive/keys/jason/"
+    else
+        ok "password file: $(detect_password "$THIS_HOST")"
+    fi
+    PASSWORD_FILE=$(detect_password "$THIS_HOST")
+    export RESTIC_PASSWORD_FILE="$PASSWORD_FILE"
+
+    if ! detect_repo "$THIS_HOST" >/dev/null; then
+        target=/mnt/backup/restic-profile/$THIS_HOST
+        warn "no repo found; initialising $target"
+        sudo mkdir -p "$target"
+        sudo -E restic init --repo "$target" && ok "repo initialised at $target"
+    else
+        ok "repo: $(detect_repo "$THIS_HOST")"
+    fi
+
+    [ -r /etc/restic/excludes.txt ] || { warn "no excludes file — install one from the repo"; }
+    if [ ! -f /etc/systemd/system/$TIMER ]; then
+        warn "nightly timer not installed; run install.sh from the restorectl checkout"
+    else
+        ok "nightly timer installed"
+    fi
+    echo; echo "  run ${c_bold}restorectl wtf${c_off} for a full posture check"
+    ;;
+
+schedule)
+    if [ $# -eq 0 ]; then
+        systemctl cat "$TIMER" 2>/dev/null | grep -E "OnCalendar|RandomizedDelay|Persistent"
+        systemctl list-timers "$TIMER" --no-pager 2>/dev/null | head -3
+    else
+        spec="$*"
+        sudo mkdir -p /etc/systemd/system/$TIMER.d
+        printf '[Timer]\nOnCalendar=\nOnCalendar=%s\n' "$spec" \
+            | sudo tee /etc/systemd/system/$TIMER.d/override.conf >/dev/null
+        sudo systemctl daemon-reload
+        sudo systemctl restart "$TIMER"
+        ok "schedule set to: $spec"
+        systemctl list-timers "$TIMER" --no-pager | head -3
+    fi
+    ;;
+
+enable)  sudo systemctl enable --now "$TIMER" && ok "nightly backups enabled" ;;
+disable) sudo systemctl disable --now "$TIMER" && warn "nightly backups DISABLED" ;;
+
+run)
+    watch=0; [ "${1:-}" = "--watch" ] && watch=1
+    sudo systemctl start --no-block "$SERVICE"
+    ok "backup started"
+    if [ "$watch" = "1" ]; then
+        echo "  (Ctrl-C stops watching; the backup keeps running)"
+        sudo journalctl -u "$SERVICE" -f -n 20
+    else
+        info "watch it: restorectl run --watch   |   restorectl status"
+    fi
+    ;;
+
+# ---- browse ----------------------------------------------------------
+snapshots|snap|list)
+    n=20; [ "${1:-}" = "-n" ] && { n=$2; shift 2; }
+    if [ "$JSON_OUT" = "1" ]; then restic_ snapshots --latest "$n" --json
+    else restic_ snapshots --latest "$n"; fi
+    ;;
+
+tree)
+    snap=${1:-latest}; path=${2:-/}
+    depth=${3:-2}
+    echo "${c_bold}$TARGET_HOST  snapshot $snap  $path${c_off}"
+    restic_ ls "$snap" "$path" --json 2>/dev/null | python3 -c "
+import json,sys,os
+base=sys.argv[1].rstrip('/') or '/'
+maxd=int(sys.argv[2])
+rows=[]
+for line in sys.stdin:
+    try: m=json.loads(line)
+    except ValueError: continue
+    if m.get('struct_type')!='node' and 'path' not in m: continue
+    p=m.get('path')
+    if not p: continue
+    rel=os.path.relpath(p, base)
+    if rel=='.': continue
+    d=rel.count('/')
+    if d>=maxd: continue
+    rows.append((rel,d,m.get('type'),m.get('size',0)))
+def human(n):
+    n=float(n or 0)
+    for u in ('B','K','M','G','T'):
+        if abs(n)<1024: return f'{n:.0f}{u}'
+        n/=1024
+    return f'{n:.0f}P'
+for rel,d,typ,size in rows:
+    name=os.path.basename(rel)
+    pre='  '*d + ('├─ ')
+    if typ=='dir': print(f'{pre}\033[1;36m{name}/\033[0m')
+    else: print(f'{pre}{name}  \033[2m{human(size)}\033[0m')
+" "$path" "$depth"
+    ;;
+
+ls)   restic_ ls "${1:-latest}" "${2:-/}" ;;
+find) [ -z "${1:-}" ] && { echo "usage: restorectl find PATTERN [SNAP]" >&2; exit 2; }
+      restic_ find --snapshot "${2:-latest}" "$1" ;;
+cat)  [ $# -lt 2 ] && { echo "usage: restorectl cat SNAP PATH" >&2; exit 2; }
+      restic_ dump "$1" "$2" ;;
+get|restore)
+      [ $# -lt 2 ] && { echo "usage: restorectl get SNAP PATH [DEST]" >&2; exit 2; }
+      dest=${3:-/tmp/restorectl-$(date +%s)}; mkdir -p "$dest"
+      restic_ restore "$1" --include "$2" --target "$dest"
+      ok "restored under: $dest$2" ;;
+diff)
+      [ $# -lt 2 ] && { echo "usage: restorectl diff SNAP PATH" >&2; exit 2; }
+      tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
+      restic_ dump "$1" "$2" > "$tmp"; diff -u "$tmp" "$2" ;;
+mount)
+      snap=${1:-latest}; mnt=${2:-/tmp/restorectl-mount}; mkdir -p "$mnt"
+      echo "mounting at $mnt (Ctrl-C to unmount)"
+      restic_ mount --snapshot-template '{{.ID}}_{{.Time.Format "2006-01-02"}}' "$mnt" ;;
+umount|unmount)
+      mnt=${1:-/tmp/restorectl-mount}; fusermount -u "$mnt" 2>/dev/null || sudo umount "$mnt" ;;
+stats) restic_ stats --mode raw-data; restic_ stats --mode restore-size ;;
+repo)
+      echo "repo:     ${RESTIC_REPOSITORY}"
+      echo "password: $PASSWORD_FILE"
+      echo "host:     $TARGET_HOST" ;;
+
+restore-system)
+      snap=${1:-latest}
+      cat <<EOF
+${c_bold}${c_red}WHOLE-SYSTEM RESTORE${c_off}
+
+This overwrites a live root filesystem. Do NOT run it against the system you
+are currently booted into — boot the recovery USB first:
+
+    restorectl mkusb /dev/sdX
+
+Then, from the live environment:
+
+    restorectl --from $TARGET_HOST restore-system $snap --target /mnt/sysroot
+
+Full runbook: docs/RECOVERY.md
+EOF
+      if [ "${2:-}" = "--target" ] && [ -n "${3:-}" ]; then
+          tgt=$3
+          [ "$tgt" = "/" ] && { bad "refusing to restore onto the running /"; exit 1; }
+          mountpoint -q "$tgt" || { bad "$tgt is not a mountpoint"; exit 1; }
+          echo; read -r -p "Restore snapshot $snap onto $tgt? Type RESTORE to confirm: " a
+          [ "$a" = "RESTORE" ] || { echo "aborted"; exit 1; }
+          restic_ restore "$snap" --target "$tgt" --verify
+          ok "restore complete — now run the chroot steps in docs/RECOVERY.md"
+      fi
+      ;;
+
+# ---- web + tray ------------------------------------------------------
+web)
+      sub=${1:-status}
+      case "$sub" in
+        install) exec "$(dirname "$0")/../web/install-web.sh" ;;
+        start)   sudo systemctl start restorectl-web && ok "web UI started on :$WEB_PORT" ;;
+        stop)    sudo systemctl stop restorectl-web && ok "web UI stopped" ;;
+        status)  systemctl status restorectl-web --no-pager 2>&1 | head -8 ;;
+        *) echo "usage: restorectl web install|start|stop|status" >&2; exit 2 ;;
+      esac ;;
+
+browse)
+      url="http://${WEB_HOST}/restorectl/"
+      echo "opening $url"
+      xdg-open "$url" >/dev/null 2>&1 || echo "  (open it manually: $url)" ;;
+
+tray)
+      # Prefer the installed copy; fall back to a source checkout.
+      for t in /usr/local/lib/restorectl/restorectl-tray.py \
+               "$(dirname "$0")/../web/restorectl-tray.py"; do
+          [ -r "$t" ] && exec python3 "$t" "$@"
+      done
+      echo "restorectl: tray app not found" >&2; exit 1 ;;
+
+mkusb)
+      exec sudo "$(dirname "$0")/mkrecovery-usb" "$@" ;;
+
+*) echo "unknown subcommand: $cmd" >&2; usage 2 ;;
+esac

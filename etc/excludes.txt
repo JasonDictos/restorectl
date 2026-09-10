@@ -1,0 +1,37 @@
+# Pseudo-filesystems and volatile state (also covered by --one-file-system,
+# listed explicitly so the intent survives a change to that flag).
+/proc
+/sys
+/dev
+/run
+/tmp
+/var/tmp
+/var/run
+/var/lock
+/lost+found
+
+# Backup targets and remote data — never back the backup up into itself.
+/mnt
+
+# Regenerable: container images/layers live on the ZFS pool and are pullable.
+/var/lib/docker
+/var/lib/containerd
+/var/lib/systemd/coredump
+/var/cache
+/var/lib/dnf/repos
+/var/lib/flatpak/repo
+
+# Build/compile caches — large, churny, reproducible from source or S3.
+**/.cache
+**/.ccache
+**/.een_ports_local_cache
+**/node_modules
+**/__pycache__
+*.pyc
+**/.local/share/Trash
+**/.gradle/caches
+**/.m2/repository
+**/.cargo/registry
+**/.cargo/git
+**/.rustup
+**/.atuin/share

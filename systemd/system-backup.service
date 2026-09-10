@@ -1,0 +1,23 @@
+[Unit]
+Description=Nightly whole-machine restic backup
+Documentation=https://github.com/JasonDictos/restorectl
+After=network-online.target remote-fs.target
+Wants=network-online.target
+# The repo lives on an NFS automount; without this the job can fire before
+# the mount is available and fail with "no repo found".
+RequiresMountsFor=/mnt/archive
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/system-backup
+# Exit 3 = "snapshot saved, some files unreadable". Deliberately NOT listed
+# in SuccessExitStatus: a system backup that silently skipped root-owned
+# files is the exact failure this service exists to prevent, so it must show
+# up as failed in `systemctl --failed`, not as a green unit.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=6h
+
+[Install]
+WantedBy=multi-user.target

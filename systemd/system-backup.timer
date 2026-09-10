@@ -1,0 +1,13 @@
+[Unit]
+Description=Nightly whole-machine restic backup
+Documentation=https://github.com/JasonDictos/restorectl
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+RandomizedDelaySec=30m
+# Catch up after downtime -- a machine that was off at 02:00 still gets its
+# backup on the next boot rather than silently skipping a night.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

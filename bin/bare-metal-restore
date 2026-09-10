@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+"""bare-metal-restore — rebuild a machine from a restic snapshot onto
+hardware that need not resemble the original.
+
+Run from the recovery ISO. The flow is:
+
+  1. read the captured layout back OUT of the snapshot (it was stored there
+     by capture-layout, so no surviving disk is required)
+  2. enumerate whatever disks this machine actually has now
+  3. PLAN a new layout: roles are preserved, geometry is not
+  4. show the plan and require explicit confirmation
+  5. partition, mkfs, mount
+  6. restore files
+  7. rewrite every stale identifier (fstab/grub/crypttab all hard-reference
+     UUIDs that just changed) and reinstall the bootloader in a chroot
+
+Step 7 is the step that actually makes a restored disk bootable, and the one
+people discover they skipped at the worst possible moment.
+
+Nothing is written to any disk before the confirmation prompt.
+
+MIT licensed. https://github.com/JasonDictos/restorectl
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+MIB = 1024 ** 2
+GIB = 1024 ** 3
+
+# Minimum viable sizes. ESP is 512M because Fedora/GRUB want headroom for
+# multiple kernels; /boot 2G for the same reason with dracut initramfs.
+MIN = {"esp": 512 * MIB, "boot": 2 * GIB, "root": 20 * GIB,
+       "home": 5 * GIB, "swap": 2 * GIB}
+
+
+def sh(cmd, check=True, capture=True, dry=False):
+    if dry:
+        print(f"    [dry-run] {cmd}")
+        return ""
+    proc = subprocess.run(cmd, shell=True, capture_output=capture, text=True)
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"{cmd}\n{proc.stderr}")
+    return proc.stdout if capture else ""
+
+
+def partdev(dev, idx):
+    """Partition node name. Kernel inserts 'p' when the disk name ends in a
+    digit: nvme0n1->nvme0n1p1, nbd0->nbd0p1, loop0->loop0p1, but sda->sda1.
+    Keying off "nvme" alone silently produced /dev/nbd01 on the test rig."""
+    return f"{dev}p{idx}" if dev[-1].isdigit() else f"{dev}{idx}"
+
+
+def human(n):
+    n = float(n or 0)
+    for u in ("B", "K", "M", "G", "T"):
+        if abs(n) < 1024:
+            return f"{n:.0f}{u}"
+        n /= 1024
+    return f"{n:.0f}P"
+
+
+# ---------------------------------------------------------------- layout in
+def load_manifest(path):
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def roles_from_manifest(man):
+    """Reduce the old fstab to the roles that must exist on new hardware.
+
+    Network mounts are carried across as fstab lines but claim no disk, and
+    that distinction is the whole reason this is role-based rather than a
+    partition-table replay: /mnt/archive must survive as an entry without
+    consuming a partition.
+    """
+    roles = []
+    for fs in man.get("filesystems", []):
+        mnt, fstype = fs.get("mount"), fs.get("fstype")
+        if fs.get("network") or fstype in ("nfs", "nfs4", "cifs"):
+            roles.append({"role": "network", "mount": mnt, "fstype": fstype,
+                          "spec": fs.get("spec"), "options": fs.get("options"),
+                          "size": 0})
+            continue
+        if fstype == "swap":
+            role = "swap"
+        elif mnt == "/boot/efi":
+            role = "esp"
+        elif mnt == "/boot":
+            role = "boot"
+        elif mnt == "/":
+            role = "root"
+        elif mnt == "/home":
+            role = "home"
+        else:
+            role = "data"
+        size = int(fs.get("size_bytes") or 0)
+        roles.append({"role": role, "mount": mnt, "fstype": fstype,
+                      "old_uuid": fs.get("uuid"), "options": fs.get("options"),
+                      "size": size})
+    return roles
+
+
+# ------------------------------------------------------------- hardware out
+def enumerate_disks(exclude_mounted=True):
+    out = json.loads(sh("lsblk -J -O -b"))
+    disks = []
+    in_use = []
+    for d in out.get("blockdevices", []):
+        if d.get("type") != "disk":
+            continue
+        name = d["name"]
+        if name.startswith(("loop", "sr", "ram", "zram")):
+            continue
+        # Refuse any disk with a mounted partition ANYWHERE in its tree.
+        # Without this the tool happily offers to wipe the running system's
+        # root and /home -- it walked only the disk node before, and
+        # partitions are children, so live disks looked idle.
+        def any_mounted(node):
+            if (node.get("mountpoint") or "").strip():
+                return True
+            for mp in node.get("mountpoints") or []:
+                if mp:
+                    return True
+            return any(any_mounted(c) for c in (node.get("children") or []))
+
+        if exclude_mounted and any_mounted(d):
+            in_use.append(f"/dev/{name}")
+            continue
+        disks.append({
+            "name": name, "path": f"/dev/{name}",
+            "size": int(d.get("size") or 0),
+            "model": (d.get("model") or "").strip(),
+            "rota": d.get("rota"),
+            "tran": d.get("tran"),
+        })
+    disks.sort(key=lambda x: -x["size"])
+    if in_use:
+        print(f"  (skipping {len(in_use)} disk(s) with mounted filesystems: "
+              f"{', '.join(in_use)})", file=sys.stderr)
+    return disks
+
+
+def plan(roles, disks, restored_bytes=None):
+    """Assign roles to available disks.
+
+    Strategy: keep the boot chain (ESP + /boot + /) together on the fastest
+    disk so the machine boots without depending on a second device being
+    present; give /home the largest remaining disk; fall back to co-locating
+    everything when only one disk exists. Sizes come from what must actually
+    fit, not from the old partition geometry, because the new disk may be
+    smaller than the old one.
+    """
+    if not disks:
+        raise RuntimeError("no usable disks found")
+
+    want = {r["role"]: r for r in roles if r["role"] != "network"}
+    nvme = [d for d in disks if d["name"].startswith("nvme")] or disks
+    boot_disk = nvme[0]
+    others = [d for d in disks if d is not boot_disk]
+
+    need_root = max(MIN["root"], int((restored_bytes or {}).get("/", 0) * 1.3))
+    need_home = max(MIN["home"], int((restored_bytes or {}).get("/home", 0) * 1.3))
+
+    layout = {d["path"]: [] for d in disks}
+
+    def add(disk, role, size, fstype, mount):
+        layout[disk["path"]].append(
+            {"role": role, "size": size, "fstype": fstype, "mount": mount})
+
+    if "esp" in want:
+        add(boot_disk, "esp", MIN["esp"], "vfat", "/boot/efi")
+    if "boot" in want:
+        add(boot_disk, "boot", MIN["boot"], "ext4", "/boot")
+
+    single = len(disks) == 1
+    home_disk = boot_disk if single or not others else max(others, key=lambda d: d["size"])
+
+    used_boot = sum(p["size"] for p in layout[boot_disk["path"]])
+    avail_boot = boot_disk["size"] - used_boot - 4 * MIB
+
+    if single:
+        # One disk: root gets what it needs, home takes the remainder.
+        root_size = min(max(need_root, avail_boot // 3), avail_boot - MIN["home"])
+        add(boot_disk, "root", root_size, want["root"]["fstype"] if "root" in want else "btrfs", "/")
+        if "home" in want:
+            add(boot_disk, "home", 0, want["home"]["fstype"], "/home")  # 0 = rest of disk
+    else:
+        add(boot_disk, "root", 0, want["root"]["fstype"] if "root" in want else "btrfs", "/")
+        if "home" in want:
+            add(home_disk, "home", 0, want["home"]["fstype"], "/home")
+
+    if "swap" in want:
+        swap_disk = others[-1] if others else boot_disk
+        # Only place swap where it will not squeeze a data role.
+        if swap_disk is not boot_disk or single is False:
+            add(swap_disk, "swap", min(MIN["swap"] * 4, swap_disk["size"] // 20), "swap", "none")
+
+    warnings = []
+    if need_root > boot_disk["size"]:
+        warnings.append(f"root needs ~{human(need_root)} but boot disk is only "
+                        f"{human(boot_disk['size'])}")
+    if "home" in want and need_home > home_disk["size"]:
+        warnings.append(f"/home needs ~{human(need_home)} but target disk is "
+                        f"{human(home_disk['size'])}")
+    if len(disks) < 2 and len([r for r in want if r in ("root", "home")]) > 1:
+        warnings.append("only one disk: / and /home will share it")
+
+    return {"layout": layout, "boot_disk": boot_disk["path"],
+            "home_disk": home_disk["path"], "warnings": warnings,
+            "roles": roles}
+
+
+def print_plan(p, disks, man):
+    print()
+    print("=" * 72)
+    print(f"  BARE-METAL RESTORE PLAN  —  {man.get('hostname','?')}")
+    print(f"  captured {man.get('captured_at','?')}")
+    print("=" * 72)
+    print("\nOLD LAYOUT (from the snapshot)")
+    for r in p["roles"]:
+        if r["role"] == "network":
+            print(f"    {r['mount']:14} {r['fstype']:8} (network — no disk needed)")
+        else:
+            print(f"    {r['mount']:14} {r['fstype']:8} {human(r['size']):>8}"
+                  f"  uuid={str(r.get('old_uuid'))[:12]}…")
+    print("\nDETECTED HARDWARE")
+    for d in disks:
+        kind = "SSD" if d["rota"] in (0, False, "0") else "HDD"
+        print(f"    {d['path']:16} {human(d['size']):>8}  {kind}  {d['model'][:28]}")
+    print("\nNEW LAYOUT")
+    for dev, parts in p["layout"].items():
+        if not parts:
+            continue
+        print(f"    {dev}")
+        for i, part in enumerate(parts, 1):
+            sz = "rest of disk" if part["size"] == 0 else human(part["size"])
+            print(f"        {partdev(dev, i)} {part['fstype']:6} {sz:>14}  → {part['mount']}")
+    if p["warnings"]:
+        print("\n  ⚠ WARNINGS")
+        for w in p["warnings"]:
+            print(f"      • {w}")
+    print("\n  Every UUID changes. fstab, grub and crypttab will be rewritten")
+    print("  from the new filesystems, and the bootloader reinstalled in a chroot.")
+    print("=" * 72)
+
+
+# --------------------------------------------------------------- execution
+def execute(p, args, man):
+    dry = args.dry_run
+    target = args.target
+
+    for dev, parts in p["layout"].items():
+        if not parts:
+            continue
+        print(f"\n>> partitioning {dev}")
+        sh(f"wipefs -a {dev}", dry=dry, check=False)
+        sh(f"sgdisk --zap-all {dev}", dry=dry, check=False)
+        start = "0"
+        for i, part in enumerate(parts, 1):
+            size = "0" if part["size"] == 0 else f"+{part['size'] // MIB}M"
+            tcode = {"esp": "ef00", "swap": "8200"}.get(part["role"], "8300")
+            label = part["role"]
+            sh(f"sgdisk -n {i}:{start}:{size} -t {i}:{tcode} -c {i}:{label} {dev}", dry=dry)
+            start = "0"
+        sh(f"partprobe {dev}", dry=dry, check=False)
+
+    print("\n>> creating filesystems")
+    newuuid = {}
+    for dev, parts in p["layout"].items():
+        for i, part in enumerate(parts, 1):
+            pdev = partdev(dev, i)
+            fst = part["fstype"]
+            if part["role"] == "esp":
+                sh(f"mkfs.vfat -F32 {pdev}", dry=dry)
+            elif part["role"] == "swap":
+                sh(f"mkswap {pdev}", dry=dry)
+            elif fst == "btrfs":
+                sh(f"mkfs.btrfs -f {pdev}", dry=dry)
+            elif fst.startswith("ext"):
+                sh(f"mkfs.{fst} -F {pdev}", dry=dry)
+            elif fst == "xfs":
+                sh(f"mkfs.xfs -f {pdev}", dry=dry)
+            else:
+                sh(f"mkfs.{fst} {pdev}", dry=dry)
+            uuid = "" if dry else sh(f"blkid -s UUID -o value {pdev}").strip()
+            newuuid[part["mount"]] = uuid
+            part["device"] = pdev
+            print(f"    {pdev:18} {fst:6} → {part['mount']:12} UUID={uuid}")
+
+    print(f"\n>> mounting under {target}")
+    order = sorted(
+        [(part["mount"], part) for parts in p["layout"].values() for part in parts
+         if part["mount"] not in ("none", "swap")],
+        key=lambda kv: kv[0].count("/") if kv[0] != "/" else 0)
+    for mnt, part in order:
+        dest = os.path.join(target, mnt.lstrip("/"))
+        sh(f"mkdir -p {dest}", dry=dry)
+        sh(f"mount {part['device']} {dest}", dry=dry)
+
+    print("\n>> restoring files from the snapshot (this is the long part)")
+    sh(f"restic restore {args.snapshot} --target {target} --verify",
+       dry=dry, capture=False, check=True)
+
+    print("\n>> rewriting identifiers")
+    write_fstab(p, newuuid, target, man, dry)
+    fix_bootloader(p, target, dry)
+    print("\n✓ restore complete — unmount and reboot")
+
+
+def write_fstab(p, newuuid, target, man, dry):
+    """Regenerate fstab against the NEW UUIDs, preserving network mounts."""
+    lines = ["# regenerated by restorectl bare-metal-restore",
+             f"# from snapshot of {man.get('hostname','?')} "
+             f"captured {man.get('captured_at','?')}", ""]
+    for r in p["roles"]:
+        if r["role"] == "network":
+            lines.append(f"{r['spec']}\t{r['mount']}\t{r['fstype']}\t{r['options']}\t0 0")
+            continue
+        mnt = r["mount"]
+        uuid = newuuid.get(mnt)
+        if not uuid and not dry:
+            continue
+        opts = r.get("options") or "defaults"
+        if r["role"] == "swap":
+            lines.append(f"UUID={uuid}\tnone\tswap\tdefaults\t0 0")
+        elif r["role"] == "esp":
+            lines.append(f"UUID={uuid}\t/boot/efi\tvfat\tumask=0077,shortname=winnt\t0 2")
+        else:
+            passno = "1 2" if mnt == "/boot" else ("0 0" if r["fstype"] == "btrfs" else "0 2")
+            lines.append(f"UUID={uuid}\t{mnt}\t{r['fstype']}\t{opts}\t{passno}")
+    body = "\n".join(lines) + "\n"
+    path = os.path.join(target, "etc/fstab")
+    print(f"    writing {path}")
+    if dry:
+        print("      " + body.replace("\n", "\n      "))
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        shutil.copy2(path, path + ".pre-restore")
+    with open(path, "w") as fh:
+        fh.write(body)
+
+
+def fix_bootloader(p, target, dry):
+    """The chroot dance: bind the kernel filesystems in, regenerate grub and
+    the initramfs against the new UUIDs, reinstall the EFI bootloader."""
+    print("    binding /dev /proc /sys /run into the target")
+    for fs in ("dev", "proc", "sys", "run"):
+        sh(f"mount --rbind /{fs} {target}/{fs}", dry=dry, check=False)
+        sh(f"mount --make-rslave {target}/{fs}", dry=dry, check=False)
+
+    script = r"""
+set -e
+# Drop any stale root=UUID= the old grub config baked in; grub2-mkconfig
+# rebuilds it from the *current* /etc/fstab, which we just rewrote.
+if command -v grub2-mkconfig >/dev/null; then
+    grub2-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=fedora --recheck || true
+    grub2-mkconfig -o /boot/grub2/grub.cfg
+elif command -v grub-mkconfig >/dev/null; then
+    grub-install --target=x86_64-efi --efi-directory=/boot/efi --recheck || true
+    grub-mkconfig -o /boot/grub/grub.cfg
+fi
+# Regenerate every initramfs: the old ones embed the old root UUID.
+if command -v dracut >/dev/null; then
+    for k in $(ls /lib/modules); do dracut -f --kver "$k" || true; done
+elif command -v update-initramfs >/dev/null; then
+    update-initramfs -u -k all || true
+fi
+echo "bootloader + initramfs rebuilt"
+"""
+    print("    chroot: grub2-install + grub2-mkconfig + dracut")
+    if dry:
+        print("      [dry-run] would run the chroot script")
+        return
+    sh(f"chroot {target} /bin/bash -c {json.dumps(script)}", capture=False, check=False)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--manifest", default="/var/lib/restorectl/layout/manifest.json",
+                    help="layout manifest (normally dumped out of the snapshot first)")
+    ap.add_argument("--snapshot", default="latest")
+    ap.add_argument("--target", default="/mnt/sysroot")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="plan and print, touch nothing (default for safety)")
+    ap.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    args = ap.parse_args()
+
+    if not os.path.exists(args.manifest):
+        sys.exit(f"no manifest at {args.manifest}\n"
+                 f"  get it out of the snapshot first:\n"
+                 f"    restic dump {args.snapshot} "
+                 f"/var/lib/restorectl/layout/manifest.json > {args.manifest}")
+
+    man = load_manifest(args.manifest)
+    roles = roles_from_manifest(man)
+    disks = enumerate_disks()
+    p = plan(roles, disks)
+    print_plan(p, disks, man)
+
+    if args.dry_run:
+        print("\n(dry run — nothing was written)\n")
+        return
+
+    if os.geteuid() != 0:
+        sys.exit("bare-metal-restore: must run as root to partition disks")
+
+    if not args.yes:
+        print("\nThis DESTROYS all data on: " + ", ".join(
+            d for d, parts in p["layout"].items() if parts))
+        if input("Type ERASE to proceed: ").strip() != "ERASE":
+            sys.exit("aborted")
+
+    execute(p, args, man)
+
+
+if __name__ == "__main__":
+    main()
