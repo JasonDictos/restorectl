@@ -39,6 +39,10 @@ MIN = {"esp": 512 * MIB, "boot": 2 * GIB, "root": 20 * GIB,
        "home": 5 * GIB, "swap": 2 * GIB}
 
 
+class NoFreeDisks(RuntimeError):
+    """Raised when every disk is claimed -- normal on a live system."""
+
+
 def sh(cmd, check=True, capture=True, dry=False):
     if dry:
         print(f"    [dry-run] {cmd}")
@@ -117,20 +121,40 @@ def enumerate_disks(exclude_mounted=True):
         name = d["name"]
         if name.startswith(("loop", "sr", "ram", "zram")):
             continue
-        # Refuse any disk with a mounted partition ANYWHERE in its tree.
-        # Without this the tool happily offers to wipe the running system's
-        # root and /home -- it walked only the disk node before, and
-        # partitions are children, so live disks looked idle.
-        def any_mounted(node):
+        # Refuse any disk that is in use. "In use" is NOT just "has a
+        # mountpoint": a ZFS pool member, LVM PV, or mdraid member presents
+        # NO mountpoint on the block device at all, so a mountpoint-only test
+        # reports an imported, actively-written pool as a free disk.
+        # (Confirmed the hard way: an imported 1.8T docker_pool holding 747G
+        # was offered as a wipe target because lsblk showed its members as
+        # fstype=zfs_member with MOUNTPOINTS empty.)
+        CLAIMED_FSTYPES = {
+            "zfs_member",           # ZFS pool -- import state is invisible here
+            "linux_raid_member",    # mdraid
+            "LVM2_member",          # LVM physical volume
+            "crypto_LUKS",          # encrypted container, may be open
+            "swap",
+        }
+
+        def claim(node):
+            """Return a reason this node is in use, or None."""
             if (node.get("mountpoint") or "").strip():
-                return True
+                return f"mounted at {node['mountpoint']}"
             for mp in node.get("mountpoints") or []:
                 if mp:
-                    return True
-            return any(any_mounted(c) for c in (node.get("children") or []))
+                    return f"mounted at {mp}"
+            fst = (node.get("fstype") or "").strip()
+            if fst in CLAIMED_FSTYPES:
+                return f"{fst} on /dev/{node.get('name')}"
+            for c in node.get("children") or []:
+                why = claim(c)
+                if why:
+                    return why
+            return None
 
-        if exclude_mounted and any_mounted(d):
-            in_use.append(f"/dev/{name}")
+        reason = claim(d) if exclude_mounted else None
+        if reason:
+            in_use.append(f"/dev/{name} ({reason})")
             continue
         disks.append({
             "name": name, "path": f"/dev/{name}",
@@ -141,8 +165,9 @@ def enumerate_disks(exclude_mounted=True):
         })
     disks.sort(key=lambda x: -x["size"])
     if in_use:
-        print(f"  (skipping {len(in_use)} disk(s) with mounted filesystems: "
-              f"{', '.join(in_use)})", file=sys.stderr)
+        print(f"  skipping {len(in_use)} disk(s) already in use:", file=sys.stderr)
+        for entry in in_use:
+            print(f"    {entry}", file=sys.stderr)
     return disks
 
 
@@ -157,7 +182,13 @@ def plan(roles, disks, restored_bytes=None):
     smaller than the old one.
     """
     if not disks:
-        raise RuntimeError("no usable disks found")
+        raise NoFreeDisks(
+            "no free disks. Every disk on this machine is already in use "
+            "(see the list above).\n"
+            "  This is expected on a running system -- bare-metal-restore is "
+            "meant to run from the recovery ISO,\n"
+            "  where the target disks are untouched. Use --dry-run here to "
+            "preview the plan safely.")
 
     want = {r["role"]: r for r in roles if r["role"] != "network"}
     nvme = [d for d in disks if d["name"].startswith("nvme")] or disks
@@ -402,7 +433,10 @@ def main():
     man = load_manifest(args.manifest)
     roles = roles_from_manifest(man)
     disks = enumerate_disks()
-    p = plan(roles, disks)
+    try:
+        p = plan(roles, disks)
+    except NoFreeDisks as exc:
+        sys.exit(f"\nbare-metal-restore: {exc}")
     print_plan(p, disks, man)
 
     if args.dry_run:
