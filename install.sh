@@ -79,6 +79,12 @@ if [ "$MODE" = client ] || [ "$MODE" = all ]; then
     install -m 0755 "$HERE/bin/bare-metal-restore"  /usr/local/sbin/
     install -d -m 0755 /usr/local/lib/restorectl
     install -m 0755 "$HERE/web/restorectl-tray.py"  /usr/local/lib/restorectl/
+    # App-menu entry, so the tray can be (re)launched from the launcher --
+    # autostart alone only runs it at login, and Quit leaves no way back.
+    install -D -m 0644 "$HERE/share/restorectl-tray.desktop" \
+        /usr/local/share/applications/restorectl-tray.desktop
+    command -v update-desktop-database >/dev/null && \
+        update-desktop-database /usr/local/share/applications || true
     install -d -m 0755 /etc/restic
     [ -f /etc/restic/excludes.txt ] || install -m 0644 "$HERE/etc/excludes.txt" /etc/restic/excludes.txt
     install -m 0644 "$HERE/systemd/system-backup.service" /etc/systemd/system/

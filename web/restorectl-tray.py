@@ -12,14 +12,18 @@ MIT licensed. https://github.com/JasonDictos/restorectl
 """
 from __future__ import annotations
 
+import fcntl
 import glob
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import time
 
 from PySide6.QtCore import QProcess, Qt, QTimer
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (QApplication, QDialog, QFrame, QGridLayout,
                                QHBoxLayout, QHeaderView, QLabel, QMenu,
@@ -35,6 +39,9 @@ LOGDIR = "/var/log/system-backup"
 # path-based URL (http://home/restorectl/) does not exist.
 WEB_URL = os.environ.get("RESTORECTL_WEB_URL", "http://home:8088/")
 POLL_MS = 4000
+# restic --mode raw-data reads every pack in the repo -- minutes, not
+# POLL_MS's 4 seconds. See _maybe_refresh_stats.
+STATS_REFRESH_S = 60
 
 IDLE_OK, RUNNING, FAILED, UNKNOWN = range(4)
 COLOURS = {
@@ -46,9 +53,35 @@ COLOURS = {
 
 
 def sh(cmd, timeout=15):
+    # subprocess.run(..., timeout=N)'s own timeout handling only kills the
+    # immediate `/bin/sh -c cmd` process, never anything IT forks -- so a
+    # pipeline like `restorectl stats | grep ...` survives as an orphan
+    # (reparented to init/systemd --user) the moment the wrapper shell dies.
+    # For anything that finishes in time this is invisible; for a command
+    # that can genuinely run past its timeout (restic --mode raw-data reads
+    # every pack in the repo -- minutes, not seconds, once a backup has any
+    # size to it) it means the real work keeps running unseen. Poll every
+    # 4s (see refresh_window) and each tick piles another one on top of the
+    # last -- that's how this tray app once ended up eating all system
+    # memory with a pile of concurrent, un-killed restic processes.
+    # start_new_session=True puts the whole pipeline in its own process
+    # group so a timeout can actually kill it, not just the wrapper.
     try:
-        return subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                              timeout=timeout).stdout.strip()
+        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True,
+                                start_new_session=True)
+    except Exception:
+        return ""
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+        return out.strip()
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.communicate()
+        return ""
     except Exception:
         return ""
 
@@ -190,6 +223,11 @@ class Window(QDialog):
         btn("Open log folder", self.open_logs, LOGDIR)
         bar.addStretch(1)
         btn("Close", self.hide)
+        # Close only hides the window; the tray keeps running. Quit exits it
+        # entirely, and aboutToQuit (see Tray) kills any restic scan still
+        # in flight so nothing is left behind.
+        btn("Quit tray", QApplication.instance().quit,
+            "Exit the tray app completely (it restarts at next login)")
         root.addLayout(bar)
 
         self.snaps_cache = []
@@ -237,22 +275,44 @@ class Tray:
         self.tray = QSystemTrayIcon(make_icon(UNKNOWN))
         self.win = Window(self)
 
-        m = QMenu()
-        self.act_status = QAction("checking…")
+        # `restorectl stats` runs restic in --mode raw-data, which reads
+        # every pack in the repo -- genuinely minutes, not the ~4s cadence
+        # everything else here polls at. _stats_proc guards re-entry so a
+        # slow scan can't get a second one stacked on top of it every time
+        # the window happens to still be open when the timer rolls over;
+        # _stats_next paces it independently of the general poll interval.
+        self._stats_cache = "—"
+        self._stats_proc = None
+        self._stats_next = 0.0
+        # Quitting (tray menu -> Quit, or the app going down some other way)
+        # tears down any in-flight QProcess's C++ side without touching the
+        # real OS process tree it wraps -- proven: a scan still running at
+        # quit time survives it, orphaned, exactly the failure mode this
+        # whole rework exists to stop. See _kill_stats_proc.
+        app.aboutToQuit.connect(self._kill_stats_proc)
+
+        # PySide6 only keeps a QAction alive while Python holds a reference
+        # or it has a Qt parent. These used to be bare locals: they were
+        # garbage-collected when __init__ returned and silently dropped out
+        # of the menu, leaving just the status line (kept alive on self).
+        # Parenting every action to the menu, and the menu to self, is
+        # what keeps them.
+        self.menu = m = QMenu()
+        self.act_status = QAction("checking…", m)
         self.act_status.setEnabled(False)
         m.addAction(self.act_status)
         m.addSeparator()
-        a_open = QAction("Open restorectl…")
+        a_open = QAction("Open restorectl…", m)
         a_open.triggered.connect(self.show_window)
         m.addAction(a_open)
-        a_web = QAction("Browse backups (web)")
+        a_web = QAction("Browse backups (web)", m)
         a_web.triggered.connect(self.win.open_web)
         m.addAction(a_web)
-        a_run = QAction("Back up now")
+        a_run = QAction("Back up now", m)
         a_run.triggered.connect(self.win.run_now)
         m.addAction(a_run)
         m.addSeparator()
-        a_quit = QAction("Quit")
+        a_quit = QAction("Quit", m)
         a_quit.triggered.connect(app.quit)
         m.addAction(a_quit)
         self.tray.setContextMenu(m)
@@ -385,8 +445,8 @@ class Tray:
         w.t_files.set(f"{s.get('total_files_processed', 0):,}" if s else "—")
         w.t_added.set(human(s.get("data_added")) if s else "—")
         w.t_next.set((nxt or "—").replace("PDT", "").replace("PST", "").strip()[-8:] or "—")
-        stats = sh("restorectl stats 2>/dev/null | grep -m1 'Total Size'")
-        w.t_repo.set(stats.split(":", 1)[1].strip() if ":" in stats else "—")
+        self._maybe_refresh_stats()
+        w.t_repo.set(self._stats_cache)
 
         logs = sorted(glob.glob(os.path.join(LOGDIR, "*.log")))
         if logs:
@@ -403,6 +463,63 @@ class Tray:
                                 w.log.verticalScrollBar().maximum())
             except OSError:
                 pass
+
+    def _maybe_refresh_stats(self):
+        # Runs `restorectl stats` (restic --mode raw-data, then
+        # --mode restore-size) as a genuinely async QProcess rather than
+        # through sh(): a blocking call here would freeze the whole UI for
+        # however long the scan takes, and the fix in sh() only stops a
+        # *timed-out* call from orphaning -- this call was never meant to
+        # time out at all, it just shouldn't be re-issued on top of itself.
+        if self._stats_proc is not None:
+            return
+        now = time.monotonic()
+        if now < self._stats_next:
+            return
+        self._stats_next = now + STATS_REFRESH_S
+        proc = QProcess()
+        # setsid (no -f: it execs in place, so QProcess still sees the same
+        # pid) makes this its own process group leader, same reason as
+        # start_new_session=True in sh() -- quitting the tray app while a
+        # scan is in flight (proven to happen: a real scan runs 45s+) must
+        # be able to kill restorectl and the restic it spawned, not just
+        # the immediate child QProcess is watching. See _kill_stats_proc.
+        proc.setProgram("setsid")
+        proc.setArguments(["/bin/sh", "-c",
+                          "restorectl stats 2>/dev/null | grep -m1 'Total Size'"])
+        proc.finished.connect(lambda *_: self._stats_finished(proc))
+        self._stats_proc = proc
+        proc.start()
+
+    def _stats_finished(self, proc):
+        try:
+            out = bytes(proc.readAllStandardOutput()).decode("utf-8", "replace").strip()
+        except RuntimeError:
+            # App quit while this scan was still running (a real scan can
+            # now take 45s+ on a real repo -- long enough to hit Quit
+            # mid-flight): Qt has already torn down the QProcess's C++ side
+            # by the time this queued signal fires. Nothing left worth
+            # updating.
+            return
+        if ":" in out:
+            self._stats_cache = out.split(":", 1)[1].strip()
+        self._stats_proc = None
+
+    def _kill_stats_proc(self):
+        proc = self._stats_proc
+        if proc is None:
+            return
+        pid = proc.processId()
+        if pid:
+            # setsid in _maybe_refresh_stats made this pid its own process
+            # group leader, so killing the group -- not just the pid Qt
+            # handed us -- takes restorectl and the restic it spawned down
+            # with it.
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        self._stats_proc = None
 
     def show_window(self):
         self.poll()
@@ -433,9 +550,44 @@ def main():
         return
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+
+    # One tray per user. A second launch (the app-menu entry, autostart
+    # racing a manual start) would otherwise add a second icon and a second
+    # poll loop running the same restic scans. The flock decides who owns
+    # it -- the kernel drops it if the owner dies, so a crash never leaves
+    # a stale lock -- and the local socket lets a second launch hand off:
+    # it asks the running tray to show its window, then exits.
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/restorectl-{os.getuid()}"
+    os.makedirs(runtime, mode=0o700, exist_ok=True)
+    lock = open(os.path.join(runtime, "restorectl-tray.lock"), "w")
+    sock_name = f"restorectl-tray-{os.getuid()}"
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        s = QLocalSocket()
+        s.connectToServer(sock_name)
+        if s.waitForConnected(1000):
+            s.write(b"show\n")
+            s.waitForBytesWritten(1000)
+            s.disconnectFromServer()
+        print("restorectl tray is already running", file=sys.stderr)
+        return
+
     if not QSystemTrayIcon.isSystemTrayAvailable():
         sys.exit("no system tray available")
-    Tray(app)
+    tray = Tray(app)
+
+    # We hold the lock, so any leftover socket is from a dead owner.
+    QLocalServer.removeServer(sock_name)
+    server = QLocalServer()
+    server.listen(sock_name)
+
+    def on_connect():
+        conn = server.nextPendingConnection()
+        conn.disconnected.connect(conn.deleteLater)
+        tray.show_window()
+    server.newConnection.connect(on_connect)
+
     sys.exit(app.exec())
 
 

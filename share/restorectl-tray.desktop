@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=restorectl backup monitor
+GenericName=Backup Monitor
+Comment=Backup status, progress and restore for restorectl
+Exec=/usr/local/bin/restorectl tray
+Icon=drive-harddisk
+Terminal=false
+Categories=Utility;Archiving;
+Keywords=backup;restic;restore;restorectl;
+StartupNotify=false
